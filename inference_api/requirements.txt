@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 python-multipart
-numpy
-tensorflow-cpu
-mediapipe
+numpy==1.26.4
+tensorflow-cpu==2.15.0
+mediapipe==0.10.11
 opencv-python-headless
 python-dotenv
 requests
+protobuf==3.20.3

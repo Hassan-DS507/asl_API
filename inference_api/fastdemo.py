@@ -73,6 +73,13 @@ def load_model():
     print("✅ Model ready")
 
 
+# ================= STARTUP EVENT =================
+@app.on_event("startup")
+def startup_event():
+    # تحميل الموديل مرة واحدة عند تشغيل السيرفر لتجنب التأخير
+    load_model()
+
+
 # ================= Sliding Window =================
 class SlidingSequence:
     def __init__(self, max_len=FIXED_FRAMES):
@@ -176,22 +183,25 @@ def call_llm_api(prompt):
 
 # ================= VIDEO ENDPOINT =================
 @app.post("/predict-video")
-async def predict_video(file: UploadFile = File(...)):
-
-    load_model()  # 🔥 مهم جداً عشان Cloud Run
-
+def predict_video(file: UploadFile = File(...)):
+    
+    temp = None
     try:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(await file.read())
+        # استخدام القراءة المتزامنة العادية بدلاً من async
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp.write(file.file.read())
         temp.close()
 
         cap = cv2.VideoCapture(temp.name)
 
         if not cap.isOpened():
+            os.unlink(temp.name)
             return {"error": "Video could not be opened"}
 
         sequence = SlidingSequence()
         engine = PredictionSystem()
+        
+        frame_counter = 0
 
         with mp_holistic.Holistic(
             min_detection_confidence=0.5,
@@ -202,7 +212,9 @@ async def predict_video(file: UploadFile = File(...)):
                 ret, frame = cap.read()
                 if not ret:
                     break
-
+                
+                frame_counter += 1
+                
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = holistic.process(rgb)
 
@@ -213,6 +225,10 @@ async def predict_video(file: UploadFile = File(...)):
                 sequence.add(kp)
 
                 if not sequence.is_ready():
+                    continue
+
+                # تخطي الفريمات لتسريع المعالجة (Predict every 3rd frame)
+                if frame_counter % 3 != 0:
                     continue
 
                 inp = sequence.as_array()
@@ -248,4 +264,7 @@ async def predict_video(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        # التأكد من حذف الملف المؤقت في حالة حدوث خطأ حتى لا يستهلك مساحة السيرفر
+        if temp is not None and os.path.exists(temp.name):
+            os.unlink(temp.name)
         return {"error": str(e)}

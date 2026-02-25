@@ -23,6 +23,56 @@ CONFIDENCE_HARD_FLOOR = 0.45
 
 app = FastAPI(title="SignSense Pro Video API")
 
+# ================= GLOBAL MODEL (Lazy Load) =================
+interpreter = None
+input_details = None
+output_details = None
+input_index = None
+output_index = None
+idx_to_sign = None
+
+
+def load_model():
+    global interpreter, input_details, output_details
+    global input_index, output_index, idx_to_sign
+
+    if interpreter is not None:
+        return
+
+    print("⏳ Loading model...")
+
+    interpreter_local = tf.lite.Interpreter(model_path=MODEL_PATH)
+    input_details_local = interpreter_local.get_input_details()
+    output_details_local = interpreter_local.get_output_details()
+
+    input_index_local = input_details_local[0]['index']
+    output_index_local = output_details_local[0]['index']
+
+    try:
+        interpreter_local.resize_tensor_input(
+            input_index_local,
+            [1, FIXED_FRAMES, N_LANDMARKS, 3]
+        )
+    except:
+        pass
+
+    interpreter_local.allocate_tensors()
+
+    with open(LABEL_MAP_PATH) as f:
+        label_map = json.load(f)
+
+    idx_to_sign_local = {v: k for k, v in label_map.items()}
+
+    interpreter = interpreter_local
+    input_details = input_details_local
+    output_details = output_details_local
+    input_index = input_index_local
+    output_index = output_index_local
+    idx_to_sign = idx_to_sign_local
+
+    print("✅ Model ready")
+
+
 # ================= Sliding Window =================
 class SlidingSequence:
     def __init__(self, max_len=FIXED_FRAMES):
@@ -39,6 +89,7 @@ class SlidingSequence:
 
     def as_array(self):
         return np.array(self.frames, dtype=np.float32)
+
 
 # ================= Prediction System =================
 class PredictionSystem:
@@ -62,45 +113,22 @@ class PredictionSystem:
                 self.current_stable_word = best
                 self.sentence_buffer.append(best)
 
-# ================= LOAD MODEL =================
-print("⏳ Loading model...")
 
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-
-input_index = input_details[0]['index']
-output_index = output_details[0]['index']
-
-try:
-    interpreter.resize_tensor_input(
-        input_index,
-        [1, FIXED_FRAMES, N_LANDMARKS, 3]
-    )
-except:
-    pass
-
-interpreter.allocate_tensors()
-
-with open(LABEL_MAP_PATH) as f:
-    label_map = json.load(f)
-
-idx_to_sign = {v: k for k, v in label_map.items()}
-
-print("✅ Model ready")
-
+# ================= Mediapipe =================
 mp_holistic = mp.solutions.holistic
+
 
 # ================= Helpers =================
 def softmax(x):
     e = np.exp(x - np.max(x))
     return e / e.sum()
 
+
 def extract_landmarks(results):
     def to_arr(lms, n):
         if lms:
             return [[l.x, l.y, l.z] for l in lms.landmark]
-        return [[np.nan]*3]*n
+        return [[np.nan] * 3] * n
 
     return np.concatenate([
         to_arr(results.face_landmarks, 468),
@@ -109,10 +137,11 @@ def extract_landmarks(results):
         to_arr(results.right_hand_landmarks, 21),
     ])
 
+
 def call_llm_api(prompt):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "GROQ_API_KEY not found"
+        return None
 
     try:
         r = requests.post(
@@ -144,9 +173,12 @@ def call_llm_api(prompt):
     except Exception as e:
         return f"LLM Error: {str(e)}"
 
+
 # ================= VIDEO ENDPOINT =================
 @app.post("/predict-video")
 async def predict_video(file: UploadFile = File(...)):
+
+    load_model()  # 🔥 مهم جداً عشان Cloud Run
 
     try:
         temp = tempfile.NamedTemporaryFile(delete=False)
@@ -174,12 +206,7 @@ async def predict_video(file: UploadFile = File(...)):
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = holistic.process(rgb)
 
-                hand_present = (
-                    results.left_hand_landmarks is not None or
-                    results.right_hand_landmarks is not None
-                )
-
-                if not hand_present:
+                if not (results.left_hand_landmarks or results.right_hand_landmarks):
                     continue
 
                 kp = extract_landmarks(results)
@@ -199,19 +226,9 @@ async def predict_video(file: UploadFile = File(...)):
                 interpreter.invoke()
 
                 out = interpreter.get_tensor(output_index)
-
-                if out.ndim == 2:
-                    logits = out[0]
-                elif out.ndim == 1:
-                    logits = out
-                else:
-                    continue
+                logits = out[0] if out.ndim == 2 else out
 
                 probs = softmax(logits)
-
-                if probs.ndim == 0:
-                    continue
-
                 top = int(np.argmax(probs))
                 conf = float(probs[top])
                 word = idx_to_sign.get(top, str(top))
@@ -222,10 +239,7 @@ async def predict_video(file: UploadFile = File(...)):
         os.unlink(temp.name)
 
         raw_sentence = " ".join(engine.sentence_buffer)
-
-        llm_sentence = None
-        if raw_sentence:
-            llm_sentence = call_llm_api(raw_sentence)
+        llm_sentence = call_llm_api(raw_sentence) if raw_sentence else None
 
         return {
             "words": engine.sentence_buffer,
@@ -235,4 +249,3 @@ async def predict_video(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
-print("API KEY:", os.getenv("GROQ_API_KEY"))

@@ -1,8 +1,9 @@
 fastapi
 uvicorn
+python-multipart
 numpy
-tensorflow
+tensorflow-cpu
 mediapipe
 opencv-python-headless
-requests
 python-dotenv
+requests

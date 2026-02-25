@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+numpy
+tensorflow
+mediapipe
+opencv-python-headless
+requests
+python-dotenv
